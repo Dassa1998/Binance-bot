@@ -3,7 +3,6 @@ import json
 import asyncio
 import logging
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from binance.client import Client
 from binance.enums import *
@@ -13,8 +12,6 @@ import ta
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI()
-
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
 class BinanceFuturesEngine:
     def __init__(self):
@@ -27,8 +24,7 @@ class BinanceFuturesEngine:
         self.is_running = False
         self.symbols = [
             "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", 
-            "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "DOTUSDT", "LINKUSDT",
-            "NEARUSDT", "APTUSDT", "ARBUSDT", "MATICUSDT", "LTCUSDT"
+            "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "NEARUSDT"
         ]
 
     def init_client(self, api_key, api_secret, testnet=True, leverage=10, margin=2.0):
@@ -146,8 +142,14 @@ async def startup_event():
 
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard():
-    with open("static/index.html", "r", encoding="utf-8") as f:
-        return f.read()
+    # Looks for index.html in the root folder or static folder automatically
+    if os.path.exists("index.html"):
+        with open("index.html", "r", encoding="utf-8") as f:
+            return f.read()
+    elif os.path.exists("static/index.html"):
+        with open("static/index.html", "r", encoding="utf-8") as f:
+            return f.read()
+    return "<h1>Index.html not found!</h1>"
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
