@@ -21,32 +21,58 @@ class BinanceFuturesEngine:
         self.client = None
         self.leverage = 10
         self.margin_usdt = 2.0
+        self.tp_pct = 0.008
+        self.sl_pct = 0.004
+        self.timeframe = '1m'
         self.is_running = False
         self.symbols = [
             "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", 
             "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "NEARUSDT"
         ]
 
-    def init_client(self, api_key, api_secret, testnet=True, leverage=10, margin=2.0):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.testnet = testnet
-        self.leverage = leverage
-        self.margin_usdt = margin
+    def init_client(self, config):
+        self.api_key = config.get("apiKey", "")
+        self.api_secret = config.get("secretKey", "")
+        self.testnet = (config.get("network") == "testnet")
+        self.leverage = int(config.get("leverage", 10))
+        self.margin_usdt = float(config.get("margin", 2.0))
+        self.tp_pct = float(config.get("tp", 0.8)) / 100.0
+        self.sl_pct = float(config.get("sl", 0.4)) / 100.0
+        self.timeframe = config.get("timeframe", "1m")
         
         try:
             self.client = Client(self.api_key, self.api_secret, testnet=self.testnet)
             if self.testnet:
                 self.client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
-            
             self.is_running = True
-            logging.info("Binance Engine Initialized Successfully!")
+            logging.info("Bot Engine Started!")
         except Exception as e:
-            logging.error(f"Init error: {e}")
+            logging.error(f"Start error: {e}")
             self.is_running = False
 
+    def stop_engine(self):
+        self.is_running = False
+        logging.info("Bot Engine Stopped!")
+
+    def panic_close_all(self):
+        if not self.client:
+            return
+        try:
+            acc_info = self.client.futures_account()
+            for pos in acc_info.get('positions', []):
+                amt = float(pos['positionAmt'])
+                if amt != 0:
+                    symbol = pos['symbol']
+                    side = SIDE_SELL if amt > 0 else SIDE_BUY
+                    self.client.futures_create_order(
+                        symbol=symbol, side=side, type=ORDER_TYPE_MARKET, quantity=abs(amt)
+                    )
+            logging.info("All positions panic closed!")
+        except Exception as e:
+            logging.error(f"Panic close error: {e}")
+
     def get_account_data(self):
-        if not self.client or not self.is_running:
+        if not self.client:
             return {"balance": 0.0, "positions": []}
         try:
             acc_info = self.client.futures_account()
@@ -69,11 +95,10 @@ class BinanceFuturesEngine:
                     })
             return {"balance": usdt_balance, "positions": positions}
         except Exception as e:
-            logging.error(f"Account data error: {e}")
             return {"balance": 0.0, "positions": []}
 
-    def fetch_klines(self, symbol, interval='1m', limit=100):
-        klines = self.client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+    def fetch_klines(self, symbol):
+        klines = self.client.futures_klines(symbol=symbol, interval=self.timeframe, limit=100)
         df = pd.DataFrame(klines, columns=[
             'timestamp', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
@@ -109,23 +134,37 @@ class BinanceFuturesEngine:
             order = self.client.futures_create_order(
                 symbol=symbol, side=side, type=ORDER_TYPE_MARKET, quantity=quantity
             )
-            logging.info(f"Order Executed: {symbol} {side}")
+            
+            tp_price = round(price * (1 + self.tp_pct) if side == 'BUY' else price * (1 - self.tp_pct), 2)
+            sl_price = round(price * (1 - self.sl_pct) if side == 'BUY' else price * (1 + self.sl_pct), 2)
+            close_side = SIDE_SELL if side == 'BUY' else SIDE_BUY
+            
+            self.client.futures_create_order(
+                symbol=symbol, side=close_side, type='TAKE_PROFIT_MARKET',
+                stopPrice=tp_price, closePosition=True
+            )
+            self.client.futures_create_order(
+                symbol=symbol, side=close_side, type='STOP_MARKET',
+                stopPrice=sl_price, closePosition=True
+            )
             return order
         except Exception as e:
-            logging.error(f"Execution failed for {symbol}: {e}")
+            logging.error(f"Execution error {symbol}: {e}")
             return None
 
     async def start_loop(self):
         while True:
             if self.is_running and self.client:
                 for symbol in self.symbols:
+                    if not self.is_running:
+                        break
                     try:
                         df = self.fetch_klines(symbol)
                         signal = self.analyze_strategy(df)
                         if signal in ["BUY", "SELL"]:
                             self.execute_trade(symbol, signal)
                     except Exception as e:
-                        logging.error(f"Loop error {symbol}: {e}")
+                        pass
             await asyncio.sleep(5)
 
 engine = BinanceFuturesEngine()
@@ -152,14 +191,14 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 raw_data = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
                 payload = json.loads(raw_data)
-                if payload.get("action") == "INIT_CONFIG":
-                    engine.init_client(
-                        api_key=payload.get("apiKey"),
-                        api_secret=payload.get("secretKey"),
-                        testnet=(payload.get("network") == "testnet"),
-                        leverage=int(payload.get("leverage", 10)),
-                        margin=float(payload.get("margin", 2.0))
-                    )
+                action = payload.get("action")
+                
+                if action == "START":
+                    engine.init_client(payload)
+                elif action == "STOP":
+                    engine.stop_engine()
+                elif action == "PANIC_CLOSE":
+                    engine.panic_close_all()
             except asyncio.TimeoutError:
                 pass
             
@@ -170,6 +209,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 "status": "ACTIVE" if engine.is_running else "STOPPED"
             }
             await websocket.send_text(json.dumps(response))
-            await asyncio.sleep(2)
+            await asyncio.sleep(1.5)
     except WebSocketDisconnect:
-        logging.info("Disconnected")
+        logging.info("Client Disconnected")
