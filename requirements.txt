@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-binance
+websockets
+pandas
+ta
+pydantic
+python-dotenv
+jinja2
