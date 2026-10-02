@@ -34,26 +34,30 @@ class BinanceFuturesEngine:
         self.leverage = leverage
         self.margin_usdt = margin
         
-        self.client = Client(self.api_key, self.api_secret, testnet=self.testnet)
-        if self.testnet:
-            self.client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
-        
-        self.is_running = True
-        logging.info("Binance Engine Initialized!")
+        try:
+            self.client = Client(self.api_key, self.api_secret, testnet=self.testnet)
+            if self.testnet:
+                self.client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
+            
+            self.is_running = True
+            logging.info("Binance Engine Initialized Successfully!")
+        except Exception as e:
+            logging.error(f"Init error: {e}")
+            self.is_running = False
 
     def get_account_data(self):
-        if not self.client:
+        if not self.client or not self.is_running:
             return {"balance": 0.0, "positions": []}
         try:
             acc_info = self.client.futures_account()
             usdt_balance = 0.0
-            for asset in acc_info['assets']:
+            for asset in acc_info.get('assets', []):
                 if asset['asset'] == 'USDT':
                     usdt_balance = float(asset['walletBalance'])
                     break
             
             positions = []
-            for pos in acc_info['positions']:
+            for pos in acc_info.get('positions', []):
                 amt = float(pos['positionAmt'])
                 if amt != 0:
                     positions.append({
@@ -99,26 +103,16 @@ class BinanceFuturesEngine:
             ticker = self.client.futures_symbol_ticker(symbol=symbol)
             price = float(ticker['price'])
             quantity = round((self.margin_usdt * self.leverage) / price, 3)
+            if quantity == 0:
+                quantity = 0.001
             
             order = self.client.futures_create_order(
                 symbol=symbol, side=side, type=ORDER_TYPE_MARKET, quantity=quantity
             )
-            
-            tp_price = round(price * (1 + 0.008) if side == 'BUY' else price * (1 - 0.008), 2)
-            sl_price = round(price * (1 - 0.004) if side == 'BUY' else price * (1 + 0.004), 2)
-            close_side = SIDE_SELL if side == 'BUY' else SIDE_BUY
-            
-            self.client.futures_create_order(
-                symbol=symbol, side=close_side, type='TAKE_PROFIT_MARKET',
-                stopPrice=tp_price, closePosition=True
-            )
-            self.client.futures_create_order(
-                symbol=symbol, side=close_side, type='STOP_MARKET',
-                stopPrice=sl_price, closePosition=True
-            )
+            logging.info(f"Order Executed: {symbol} {side}")
             return order
         except Exception as e:
-            logging.error(f"Execution failed: {e}")
+            logging.error(f"Execution failed for {symbol}: {e}")
             return None
 
     async def start_loop(self):
@@ -142,7 +136,6 @@ async def startup_event():
 
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard():
-    # Looks for index.html in the root folder or static folder automatically
     if os.path.exists("index.html"):
         with open("index.html", "r", encoding="utf-8") as f:
             return f.read()
@@ -156,17 +149,19 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            raw_data = await websocket.receive_text()
-            payload = json.loads(raw_data)
-            
-            if payload.get("action") == "INIT_CONFIG":
-                engine.init_client(
-                    api_key=payload.get("apiKey"),
-                    api_secret=payload.get("secretKey"),
-                    testnet=(payload.get("network") == "testnet"),
-                    leverage=int(payload.get("leverage", 10)),
-                    margin=float(payload.get("margin", 2.0))
-                )
+            try:
+                raw_data = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
+                payload = json.loads(raw_data)
+                if payload.get("action") == "INIT_CONFIG":
+                    engine.init_client(
+                        api_key=payload.get("apiKey"),
+                        api_secret=payload.get("secretKey"),
+                        testnet=(payload.get("network") == "testnet"),
+                        leverage=int(payload.get("leverage", 10)),
+                        margin=float(payload.get("margin", 2.0))
+                    )
+            except asyncio.TimeoutError:
+                pass
             
             acc_data = engine.get_account_data()
             response = {
@@ -175,6 +170,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 "status": "ACTIVE" if engine.is_running else "STOPPED"
             }
             await websocket.send_text(json.dumps(response))
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
     except WebSocketDisconnect:
         logging.info("Disconnected")
